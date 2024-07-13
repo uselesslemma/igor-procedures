@@ -1,0 +1,228 @@
+#pragma TextEncoding = "UTF-8"
+#pragma rtGlobals=3		// Use modern global access method and strict wave access.
+#include <WindowBrowser>
+
+
+//************************  Helper Functions  ***************************//
+
+// Wien's Law: Calculate temperature from peak wavelength
+Function Wien(wavePeak)
+    Variable wavePeak           // Wavelength [meters]
+    Variable b = 2.897771955e-3 // Wien's displacement constant [m·K]
+    return b / wavePeak
+End
+
+// Convert nanometers to meters
+Function nmToMeters(nm)
+    Variable nm                 // Wavelength in nanometers
+    return nm * 1e-9
+End
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////
+//**************  Blackbody Spectrum Fit (Planck Distribution)  ****************//
+//////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+/////////////////// (1/3) Defining the Custom Fit //////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+//*****PURPOSE: Planck's law for blackbody radiation + polynomial background correction
+Function PlanckBlackbodyFitFunc(w, lambda) : FitFunc
+
+	 // VARIABLES
+    WAVE w                      // Array of fit coefficients
+    Variable lambda             // Independent variable (wavelength)
+    lambda = nmToMeters(lambda) // Convert wavelength from [nm] to [m]
+    
+    // CONSTANTS
+    Variable h = 6.62607015e-34 // Planck's constant (J·s)
+    Variable c = 2.99792458e8   // Speed of light (m/s)
+    Variable k = 1.380649e-23   // Boltzmann constant (J/K)
+    
+    // PARAMETERS
+    Variable T = w[0]           // Blackbody surface temperature
+    Variable scale = w[1]       // Intensity scale factor
+    Variable a = w[2]           // Constant correction term
+    Variable b = w[3]           // Linear correction coefficient
+    
+    
+    // Planck's law formula
+    Variable intensity = (2 * h * c^2) / (lambda^5 * (exp((h * c) / (lambda * k * T)) - 1))
+    
+    // Polynomial background correction factor
+    Variable poly = a + b * lambda
+
+    // Normalize the intensity by the scale factor and add polynomial background
+    intensity = scale * intensity + poly
+
+    return intensity
+End
+
+
+////////////////////////////////////////////////////////////////////////////////
+/////////////////// (2/3) Data Weight Adjustments //////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+//*****PURPOSE: to automatically identify & downweight absorption regions*****//
+Function/WAVE IdentifyAbsorptionRegions(waveX, waveY, smoothingWindow)
+
+	 // VARIABLES
+    Wave waveX, waveY
+    Variable smoothingWindow
+
+    // Copy & smooth y-wave (intensity) to identify local minima
+    Make/O/N=(numpnts(waveY)) smoothedY
+    Duplicate/O waveY, smoothedY
+    
+    // Apply Savitzky-Golay smoothing (polynomial order 2 OR 4 ONLY)
+    Smooth/S=4 smoothingWindow, smoothedY
+
+    // Identify local minima
+    Make/O/N=(numpnts(smoothedY)) absorptionRegions
+    Variable count = 0
+    Variable i
+    for(i = 1; i < numpnts(smoothedY) - 1; i += 1)
+        if(smoothedY[i] < smoothedY[i-1] && smoothedY[i] < smoothedY[i+1])
+            absorptionRegions[count] = waveX[i]
+            count += 1
+        endif
+    endfor
+
+    // Ensure there is at least one absorption region to avoid empty wave issues
+    if(count == 0)
+        Redimension/N=1 absorptionRegions
+        absorptionRegions[0] = 0     // Dummy value
+    else
+        Redimension/N=(count) absorptionRegions
+    endif
+    
+    return absorptionRegions
+End
+
+
+//*****PURPOSE: Create a dynamic weight wave based on identified absorption regions*****//
+Function/WAVE CreateDynamicWeightWave(waveX, waveY, absorptionRegions, peakLambdaGuessNM)
+    
+    // VARIABLES
+    Wave waveX, waveY, absorptionRegions
+    Variable peakLambdaGuessNM
+    Variable numPoints = numpnts(waveX)
+    Make/D/O/N=(numPoints) weightWave
+    weightWave = 1   // Default weight
+
+    // Adjust weights based on absorption regions
+    Variable i, j
+    for(i = 0; i < numPoints; i += 1)
+        for(j = 0; j < numpnts(absorptionRegions); j += 1)
+            if(abs(waveX[i] - absorptionRegions[j]) < 1)  // Adjust this threshold as needed
+                weightWave[i] = 0.3                       // Lower weight for absorption regions
+            endif
+        endfor
+        
+        //*****Increase weight near the peak region (adjust range as needed)*****
+        if(waveX[i] > peakLambdaGuessNM - 50 && waveX[i] < peakLambdaGuessNM + 50)
+            weightWave[i] *= 2
+        endif
+    endfor
+
+    return weightWave
+End
+
+
+////////////////////////////////////////////////////////////////////////////////
+////////////////////// (3/3) PERFORM CUSTOM FIT ////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+
+Function FitPlanckBlackbodyIterative(waveX, waveY, peakLambdaGuessNM, scaleGuess, smoothingWindow, [aBound, bBound])
+    Wave waveX, waveY
+    Variable smoothingWindow           // Typical values: ~3-15
+    Variable peakLambdaGuessNM, scaleGuess, aBound, bBound
+    
+
+    // Create a separate wave for processing to avoid modifying the original wave
+    Wave waveYCopy
+    Duplicate/O waveY, waveYCopy
+
+    // Auto-identify absorption regions
+    Wave absorptionRegions = IdentifyAbsorptionRegions(waveX, waveYCopy, smoothingWindow)
+
+    // Create dynamic weight wave
+    Wave weightWave = CreateDynamicWeightWave(waveX, waveY, absorptionRegions, peakLambdaGuessNM)
+
+    // Estimate initial temperature from peak wavelength guess
+    Variable peakLambdaGuess = nmToMeters(peakLambdaGuessNM)
+    Variable temperatureGuess = Wien(peakLambdaGuess)
+
+    // Create a double-precision wave to hold the fit coefficients
+    Make/D/O/N=4 fitCoeffs
+    fitCoeffs[0] = temperatureGuess
+    fitCoeffs[1] = scaleGuess
+    fitCoeffs[2] = 0  // Initial guess for constant polynomial term (a)
+    fitCoeffs[3] = 0  // Initial guess for linear polynomial term (b)
+
+    Variable iteration = 0
+    Variable maxIterations = 15    // Increase if fit converges too slowly
+    Variable prevChisq = 1e30
+    Variable tol = 1e-6            // Tolerance level
+    Variable V_chisq
+
+    do
+        iteration += 1
+
+        // Perform the fit with the weight wave
+        FuncFit PlanckBlackbodyFitFunc, fitCoeffs, waveY /X=waveX /W=weightWave
+        
+        // Constrain the coefficients within the specified limits if bounds are set
+        if(ParamIsDefault(aBound))
+            aBound = 1e30
+            break
+        elseif (fitCoeffs[2] < -aBound)
+            fitCoeffs[2] = -aBound
+        elseif (fitCoeffs[2] > aBound)
+            fitCoeffs[2] = aBound
+        endif
+        if(ParamIsDefault(bBound))
+            bBound = 1e30
+            break
+        elseif (fitCoeffs[3] < -bBound)
+            fitCoeffs[3] = -bBound
+        elseif (fitCoeffs[3] > bBound)
+            fitCoeffs[3] = bBound
+        endif
+
+        // Check for convergence
+        if(abs(prevChisq - V_chisq) < tol)
+            break
+        endif
+
+        prevChisq = V_chisq
+
+        // Update weights based on residuals
+        Make/O/N=(numpnts(waveY)) residuals
+        Variable i
+        for(i = 0; i < numpnts(waveX); i += 1)
+            residuals[i] = waveY[i] - PlanckBlackbodyFitFunc(fitCoeffs, waveX[i])
+        endfor
+
+        // Identify new absorption regions
+        Wave tempAbsorptionRegions = IdentifyAbsorptionRegions(waveX, residuals, smoothingWindow)
+        absorptionRegions = tempAbsorptionRegions
+
+        // Create new dynamic weight wave
+        Wave tempWeightWave = CreateDynamicWeightWave(waveX, waveY, absorptionRegions, peakLambdaGuessNM)
+        weightWave = tempWeightWave
+
+    while(iteration < maxIterations)
+
+    // Print the fitted parameters
+    Printf "\n\n\n\n"
+    Printf "Fitted temperature: %.2f K\n", fitCoeffs[0]
+    Printf "Fitted scale factor: %.2e\n", fitCoeffs[1]
+    Printf "Polynomial term a: %.2e\n", fitCoeffs[2]
+    Printf "Polynomial term b: %.2e\n", fitCoeffs[3]
+    Printf "Chi-square: %.4f\n", V_chisq
+End
